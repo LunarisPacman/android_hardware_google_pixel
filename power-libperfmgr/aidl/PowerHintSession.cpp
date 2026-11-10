@@ -271,6 +271,7 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::pause()
         return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
     // Reset to default uclamp value.
     mDescriptor->is_active.store(false);
+    mFirstFrameAfterResume = false;
     mPSManager->pause(mSessionId);
     mPSManager->setThreadsFromPowerSession(mSessionId, {});
     ATRACE_INT(mAppDescriptorTrace->trace_active.c_str(), false);
@@ -290,6 +291,12 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::resume(
     }
     mPSManager->setThreadsFromPowerSession(mSessionId, mDescriptor->thread_ids);
     mDescriptor->is_active.store(true);
+    // Reset stale timing and PID/heuristic boost states from prior active period
+    mDescriptor->integral_error = 0;
+    mDescriptor->previous_error = 0;
+    mLastUpdatedTime = std::chrono::steady_clock::now();
+    resetSessionHeuristicStates();
+    mFirstFrameAfterResume = true;
     // resume boost
     mPSManager->resume(mSessionId);
     ATRACE_INT(mAppDescriptorTrace->trace_active.c_str(), true);
@@ -353,7 +360,9 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::updateT
 
 template <class HintManagerT, class PowerSessionManagerT>
 void PowerHintSession<HintManagerT, PowerSessionManagerT>::resetSessionHeuristicStates() {
-    mSessionRecords->resetRecords();
+    if (mSessionRecords) {
+        mSessionRecords->resetRecords();
+    }
     mJankyLevel = SessionJankyLevel::LIGHT;
     mJankyFrameNum = 0;
     ATRACE_INT(mAppDescriptorTrace->trace_hboost_janky_level.c_str(),
@@ -439,23 +448,50 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::reportA
         return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_ARGUMENT);
     }
     if (!mDescriptor->is_active.load()) {
-        ALOGE("Error: shouldn't report duration during pause state.");
-        return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
+        ALOGV("Skipping duration report during pause state.");
+        return ndk::ScopedAStatus::ok();
     }
     auto adpfConfig = getAdpfProfile();
+
+    bool isFirstFrameAfterResume = mFirstFrameAfterResume;
+    mFirstFrameAfterResume = false;
+
+    std::vector<WorkDuration> validDurations;
+    if (isFirstFrameAfterResume) {
+        int64_t targetDurationNanos = mDescriptor->targetNs.count();
+        int64_t maxReasonableDuration = targetDurationNanos * 20;
+        for (const auto &dur : actualDurations) {
+            if (std::abs(dur.durationNanos) > maxReasonableDuration) {
+                ALOGV("Ignoring screen-off/pause interval duration (%" PRId64
+                      " ns) on session resume",
+                      dur.durationNanos);
+            } else {
+                validDurations.push_back(dur);
+            }
+        }
+        if (validDurations.empty()) {
+            mLastUpdatedTime = std::chrono::steady_clock::now();
+            updatePidControlVariable(adpfConfig->mUclampMinInit);
+            return ndk::ScopedAStatus::ok();
+        }
+    }
+    const std::vector<WorkDuration> &durationsToProcess =
+            isFirstFrameAfterResume ? validDurations : actualDurations;
+
     mDescriptor->update_count++;
     bool isFirstFrame = isTimeout();
-    ATRACE_INT(mAppDescriptorTrace->trace_batch_size.c_str(), actualDurations.size());
-    ATRACE_INT(mAppDescriptorTrace->trace_actl_last.c_str(), actualDurations.back().durationNanos);
+    ATRACE_INT(mAppDescriptorTrace->trace_batch_size.c_str(), durationsToProcess.size());
+    ATRACE_INT(mAppDescriptorTrace->trace_actl_last.c_str(),
+               durationsToProcess.back().durationNanos);
     ATRACE_INT(mAppDescriptorTrace->trace_target.c_str(), mDescriptor->targetNs.count());
     ATRACE_INT(mAppDescriptorTrace->trace_hint_count.c_str(), mDescriptor->update_count);
     ATRACE_INT(mAppDescriptorTrace->trace_hint_overtime.c_str(),
-               actualDurations.back().durationNanos - mDescriptor->targetNs.count() > 0);
+               durationsToProcess.back().durationNanos - mDescriptor->targetNs.count() > 0);
     ATRACE_INT(mAppDescriptorTrace->trace_is_first_frame.c_str(), (isFirstFrame) ? (1) : (0));
     ATRACE_INT(mAppDescriptorTrace->trace_cpu_duration.c_str(),
-               actualDurations.back().cpuDurationNanos);
+               durationsToProcess.back().cpuDurationNanos);
     ATRACE_INT(mAppDescriptorTrace->trace_gpu_duration.c_str(),
-               actualDurations.back().gpuDurationNanos);
+               durationsToProcess.back().gpuDurationNanos);
 
     mLastUpdatedTime = std::chrono::steady_clock::now();
 
@@ -474,9 +510,9 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::reportA
     if (hboostEnabled) {
         FrameTimingMetrics newFrameMetrics;
         mSessionRecords->addReportedDurations(
-                actualDurations, mDescriptor->targetNs.count(), newFrameMetrics,
+                durationsToProcess, mDescriptor->targetNs.count(), newFrameMetrics,
                 mSessTag == SessionTag::SURFACEFLINGER && mPSManager->getGameModeEnableState());
-        mPSManager->updateHboostStatistics(mSessionId, mJankyLevel, actualDurations.size());
+        mPSManager->updateHboostStatistics(mSessionId, mJankyLevel, durationsToProcess.size());
         mPSManager->updateFrameMetrics(mSessionId, newFrameMetrics);
         mPSManager->updateCollectedSessionMetrics(mSessionId);
         updateHeuristicBoost();
@@ -487,7 +523,7 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::reportA
         }
     }
 
-    int64_t output = convertWorkDurationToBoostByPid(actualDurations);
+    int64_t output = convertWorkDurationToBoostByPid(durationsToProcess);
 
     // Apply to all the threads in the group
     auto uclampMinFloor = adpfConfig->mUclampMinLow;
@@ -530,7 +566,7 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::reportA
     updatePidControlVariable(next_min);
 
     if (!adpfConfig->mGpuBoostOn.value_or(false) || !adpfConfig->mGpuBoostCapacityMax ||
-        !actualDurations.back().gpuDurationNanos) {
+        !durationsToProcess.back().gpuDurationNanos) {
         return ndk::ScopedAStatus::ok();
     }
 
@@ -539,7 +575,7 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::reportA
         return ndk::ScopedAStatus::ok();
     }
     auto const additional_gpu_capacity =
-            calculate_capacity(actualDurations.back(), mDescriptor->targetNs, *gpu_freq);
+            calculate_capacity(durationsToProcess.back(), mDescriptor->targetNs, *gpu_freq);
     ATRACE_INT(mAppDescriptorTrace->trace_gpu_capacity.c_str(),
                static_cast<int>(additional_gpu_capacity));
 

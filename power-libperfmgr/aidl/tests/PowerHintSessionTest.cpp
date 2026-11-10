@@ -370,6 +370,67 @@ TEST_F(PowerHintSessionMockedTest, updateSessionJankState) {
               mHintSession->updateSessionJankState(SessionJankyLevel::LIGHT, 9, 5.0, false));
 }
 
+TEST_F(PowerHintSessionMockedTest, reportWhilePaused) {
+    mHintSession->updateTargetWorkDuration(5000000);
+    EXPECT_TRUE(mHintSession->pause().isOk());
+    WorkDuration duration{.durationNanos = 5000000};
+    auto status = mHintSession->reportActualWorkDuration({duration});
+    EXPECT_TRUE(status.isOk());
+}
+
+TEST_F(PowerHintSessionMockedTest, pauseFollowedByResume) {
+    mHintSession->updateTargetWorkDuration(5000000);
+    // Simulate some prior PID error accumulation
+    mHintSession->mDescriptor->integral_error = 1000;
+    mHintSession->mDescriptor->previous_error = 500;
+
+    EXPECT_TRUE(mHintSession->pause().isOk());
+    EXPECT_FALSE(mHintSession->mDescriptor->is_active.load());
+
+    EXPECT_TRUE(mHintSession->resume().isOk());
+    EXPECT_TRUE(mHintSession->mDescriptor->is_active.load());
+    EXPECT_EQ(0, mHintSession->mDescriptor->integral_error);
+    EXPECT_EQ(0, mHintSession->mDescriptor->previous_error);
+    EXPECT_TRUE(mHintSession->mFirstFrameAfterResume);
+    EXPECT_EQ(SessionJankyLevel::LIGHT, mHintSession->mJankyLevel);
+}
+
+TEST_F(PowerHintSessionMockedTest, firstReportAfterResume) {
+    mHintSession->updateTargetWorkDuration(5000000);
+    EXPECT_TRUE(mHintSession->pause().isOk());
+    EXPECT_TRUE(mHintSession->resume().isOk());
+    EXPECT_TRUE(mHintSession->mFirstFrameAfterResume);
+
+    // Report a stale duration representing the entire screen-off interval (e.g. 120 ms >> 5 ms target)
+    WorkDuration screenOffDuration{.durationNanos = 120000000};
+    auto status = mHintSession->reportActualWorkDuration({screenOffDuration});
+    EXPECT_TRUE(status.isOk());
+
+    // Verify it was treated as screen-off interval and did not corrupt PID state or escalate jank
+    EXPECT_FALSE(mHintSession->mFirstFrameAfterResume);
+    EXPECT_EQ(0, mHintSession->mDescriptor->integral_error);
+    EXPECT_EQ(0, mHintSession->mDescriptor->previous_error);
+    EXPECT_EQ(SessionJankyLevel::LIGHT, mHintSession->mJankyLevel);
+}
+
+TEST_F(PowerHintSessionMockedTest, normalActiveSessionReporting) {
+    mHintSession->updateTargetWorkDuration(5000000);
+    // Normal active frame
+    WorkDuration normalDuration{.durationNanos = 5000000};
+    auto status = mHintSession->reportActualWorkDuration({normalDuration});
+    EXPECT_TRUE(status.isOk());
+
+    // Pause and resume cycle followed by normal reporting
+    EXPECT_TRUE(mHintSession->pause().isOk());
+    EXPECT_TRUE(mHintSession->resume().isOk());
+
+    // Normal frame reported after resume
+    WorkDuration normalResumeDuration{.durationNanos = 5200000};
+    status = mHintSession->reportActualWorkDuration({normalResumeDuration});
+    EXPECT_TRUE(status.isOk());
+    EXPECT_FALSE(mHintSession->mFirstFrameAfterResume);
+}
+
 using TestingPowerHintSessionHintMocked =
         PowerHintSession<testing::NiceMock<mock::pixel::MockHintManager>,
                          PowerSessionManager<testing::NiceMock<mock::pixel::MockHintManager>>>;

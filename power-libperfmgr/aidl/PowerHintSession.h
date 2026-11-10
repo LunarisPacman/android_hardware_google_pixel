@@ -109,6 +109,7 @@ class PowerHintSession : public BnPowerHintSession, public Immobile {
     std::shared_ptr<AppDescriptorTrace> mAppDescriptorTrace;
     time_point<steady_clock> mLastUpdatedTime GUARDED_BY(mPowerHintSessionLock);
     bool mSessionClosed GUARDED_BY(mPowerHintSessionLock) = false;
+    bool mFirstFrameAfterResume GUARDED_BY(mPowerHintSessionLock){false};
     // Are cpu load change related hints are supported
     std::unordered_map<std::string, std::optional<bool>> mutable mSupportedHints;
     // Use the value of the last enum in enum_range +1 as array size
