@@ -431,6 +431,18 @@ TEST_F(PowerHintSessionMockedTest, normalActiveSessionReporting) {
     EXPECT_FALSE(mHintSession->mFirstFrameAfterResume);
 }
 
+TEST_F(PowerHintSessionMockedTest, stallDurationFilteringActiveSession) {
+    mHintSession->updateTargetWorkDuration(5000000);
+    // Report an extreme stall duration on active session (e.g. SurfaceFlinger display power transition 272 ms >> 5 ms target)
+    WorkDuration stallDuration{.durationNanos = 272000000};
+    auto status = mHintSession->reportActualWorkDuration({stallDuration});
+    EXPECT_TRUE(status.isOk());
+
+    // Verify it was filtered out and did not corrupt PID state or accumulate error
+    EXPECT_EQ(0, mHintSession->mDescriptor->integral_error);
+    EXPECT_EQ(0, mHintSession->mDescriptor->previous_error);
+}
+
 using TestingPowerHintSessionHintMocked =
         PowerHintSession<testing::NiceMock<mock::pixel::MockHintManager>,
                          PowerSessionManager<testing::NiceMock<mock::pixel::MockHintManager>>>;

@@ -90,8 +90,10 @@ int64_t PowerHintSession<HintManagerT, PowerSessionManagerT>::convertWorkDuratio
     for (int64_t i = std::min({p_start, i_start, d_start}); i < length; i++) {
         int64_t actualDurationNanos = actualDurations[i].durationNanos;
         if (std::abs(actualDurationNanos) > targetDurationNanos * 20) {
-            ALOGW("The actual duration is way far from the target (%" PRId64 " >> %" PRId64 ")",
+            ALOGV("The actual duration is way far from the target (%" PRId64 " >> %" PRId64 ")",
                   actualDurationNanos, targetDurationNanos);
+            actualDurationNanos = std::clamp(actualDurationNanos, -targetDurationNanos * 20,
+                                             targetDurationNanos * 20);
         }
         // PID control algorithm
         int64_t error = ns_to_100us(actualDurationNanos - targetDurationNanos);
@@ -289,7 +291,6 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::resume(
     if (mDescriptor->is_active.load()) {
         return ndk::ScopedAStatus::fromExceptionCode(EX_ILLEGAL_STATE);
     }
-    mPSManager->setThreadsFromPowerSession(mSessionId, mDescriptor->thread_ids);
     mDescriptor->is_active.store(true);
     // Reset stale timing and PID/heuristic boost states from prior active period
     mDescriptor->integral_error = 0;
@@ -299,6 +300,7 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::resume(
     mFirstFrameAfterResume = true;
     // resume boost
     mPSManager->resume(mSessionId);
+    mPSManager->setThreadsFromPowerSession(mSessionId, mDescriptor->thread_ids);
     ATRACE_INT(mAppDescriptorTrace->trace_active.c_str(), true);
     ATRACE_INT(mAppDescriptorTrace->trace_min.c_str(), mDescriptor->pidControlVariable);
     return ndk::ScopedAStatus::ok();
@@ -453,30 +455,30 @@ ndk::ScopedAStatus PowerHintSession<HintManagerT, PowerSessionManagerT>::reportA
     }
     auto adpfConfig = getAdpfProfile();
 
-    bool isFirstFrameAfterResume = mFirstFrameAfterResume;
     mFirstFrameAfterResume = false;
 
+    int64_t targetDurationNanos = mDescriptor->targetNs.count();
+    int64_t maxReasonableDuration = targetDurationNanos * 20;
+
     std::vector<WorkDuration> validDurations;
-    if (isFirstFrameAfterResume) {
-        int64_t targetDurationNanos = mDescriptor->targetNs.count();
-        int64_t maxReasonableDuration = targetDurationNanos * 20;
-        for (const auto &dur : actualDurations) {
-            if (std::abs(dur.durationNanos) > maxReasonableDuration) {
-                ALOGV("Ignoring screen-off/pause interval duration (%" PRId64
-                      " ns) on session resume",
-                      dur.durationNanos);
-            } else {
-                validDurations.push_back(dur);
-            }
-        }
-        if (validDurations.empty()) {
-            mLastUpdatedTime = std::chrono::steady_clock::now();
-            updatePidControlVariable(adpfConfig->mUclampMinInit);
-            return ndk::ScopedAStatus::ok();
+    for (const auto &dur : actualDurations) {
+        if (std::abs(dur.durationNanos) > maxReasonableDuration) {
+            ALOGV("Ignoring screen-off/stall interval duration (%" PRId64
+                  " ns >> %" PRId64 " ns)",
+                  dur.durationNanos, targetDurationNanos);
+        } else {
+            validDurations.push_back(dur);
         }
     }
-    const std::vector<WorkDuration> &durationsToProcess =
-            isFirstFrameAfterResume ? validDurations : actualDurations;
+
+    if (validDurations.empty()) {
+        mLastUpdatedTime = std::chrono::steady_clock::now();
+        mDescriptor->integral_error = 0;
+        mDescriptor->previous_error = 0;
+        updatePidControlVariable(adpfConfig->mUclampMinInit);
+        return ndk::ScopedAStatus::ok();
+    }
+    const std::vector<WorkDuration> &durationsToProcess = validDurations;
 
     mDescriptor->update_count++;
     bool isFirstFrame = isTimeout();
